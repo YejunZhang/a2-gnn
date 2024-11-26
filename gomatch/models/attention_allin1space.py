@@ -1,0 +1,653 @@
+# Original code src: https://github.com/overlappredator/OverlapPredator/blob/main/models/gcn.py
+
+from copy import deepcopy
+from typing import Iterable, List, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+
+
+def square_distance(
+    src: torch.Tensor, dst: torch.Tensor, normalized: bool = False
+) -> torch.Tensor:
+    """
+    Calculate Euclid distance between each two points.
+    Args:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Returns:
+        dist: per-point square distance, [B, N, M]
+    """
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
+    if normalized:
+        dist += 2
+    else:
+        dist += torch.sum(src ** 2, dim=-1)[:, :, None]
+        dist += torch.sum(dst ** 2, dim=-1)[:, None, :]
+
+    dist = torch.clamp(dist, min=1e-12, max=None)
+    return dist
+
+
+def get_graph_feature(
+    coords: torch.Tensor, feats: torch.Tensor, k: int = 10
+) -> torch.Tensor:
+    """
+    Apply KNN search based on coordinates, then concatenate the features to the centroid features
+    Input:
+        X:          [B, 3, N]
+        feats:      [B, C, N]
+    Return:
+        feats_cat:  [B, 2C, N, k]
+    """
+    # apply KNN search to build neighborhood
+    B, C, N = feats.size()
+    k = min(k, N - 1)  # There are cases the input data points are fewer than k
+    dist = square_distance(coords.transpose(1, 2), coords.transpose(1, 2))
+    idx = dist.topk(k=k + 1, dim=-1, largest=False, sorted=True)[
+        1
+    ]  # [B, N, K+1], here we ignore the smallest element as it's the query itself
+    idx = idx[:, :, 1:]  # [B, N, K]
+    return_idx = idx.clone()
+
+    idx = idx.unsqueeze(1).repeat(1, C, 1, 1)  # [B, C, N, K]
+    all_feats = feats.unsqueeze(2).repeat(1, 1, N, 1)  # [B, C, N, N]
+
+    neighbor_feats = torch.gather(all_feats, dim=-1, index=idx)  # [B, C, N, K]
+
+    # concatenate the features with centroid
+    feats = feats.unsqueeze(-1).repeat(1, 1, 1, k)
+
+    feats_cat = torch.cat((feats, neighbor_feats - feats), dim=1)
+
+    return feats_cat, return_idx
+
+def knn(x, k):
+    inner = -2*torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x**2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+
+    idx = pairwise_distance.topk(k=k+1, dim=-1)[1]   # (batch_size, num_points, k)
+    # ignore self node
+    return idx[:, :, 1:]
+    
+def get_graph_feature1(x, k=20, idx=None):
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
+    if idx is None:
+        idx_out = knn(x, k=k)
+    else:
+        idx_out = idx
+    device = x.device
+
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
+
+    idx = idx_out + idx_base
+
+    idx = idx.view(-1)
+
+    _, num_dims, _ = x.size()
+
+    x = x.transpose(2, 1).contiguous()
+    feature = x.view(batch_size*num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+    feature = torch.cat((x, x - feature), dim=3).permute(0, 3, 1, 2).contiguous()
+    return feature
+
+def cosine_similarity(tensor_a, tensor_b):
+
+    # Ensure the tensors are float for dot product and norm calculations
+    tensor_a = tensor_a.float()
+    tensor_b = tensor_b.float()
+    
+    # Calculate the dot product along the 0th dimension (sum over the 2 elements in each column)
+    dot_product = (tensor_a * tensor_b).sum(dim=1)
+    
+    # Calculate the norm of each tensor along the 0th dimension
+    norm_a = tensor_a.norm(dim=1)
+    norm_b = tensor_b.norm(dim=1)
+    
+    # Calculate the cosine similarity
+    cos_sim = dot_product / (norm_a * norm_b)
+    
+    # Reshape to [1, 805] to match the desired output shape
+    cos_sim = cos_sim.unsqueeze(1)
+    
+    return cos_sim
+
+class SelfAttention1(nn.Module):
+    def __init__(self, feature_dim: int, k: int = 10) -> None:
+        super(SelfAttention1, self).__init__()
+        self.conv1 = nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=1, bias=False)
+        self.in1 = nn.InstanceNorm2d(feature_dim)
+
+        self.conv2 = nn.Conv2d(
+            feature_dim * 2, feature_dim * 2, kernel_size=1, bias=False
+        )
+        self.in2 = nn.InstanceNorm2d(feature_dim * 2)
+
+        # ++
+        self.conv25 = nn.Conv2d(
+            feature_dim * 2, feature_dim * 2, kernel_size=1, bias=False
+        )
+        self.in25 = nn.InstanceNorm2d(feature_dim * 2)
+
+        self.conv3 = nn.Conv2d(feature_dim * 4, feature_dim, kernel_size=1, bias=False)
+        self.in3 = nn.InstanceNorm2d(feature_dim)
+
+        self.conv3_old = nn.Conv2d(feature_dim * 6, feature_dim, kernel_size=1, bias=False)
+        self.in3_old = nn.InstanceNorm2d(feature_dim)
+
+        self.in_channel = 128
+        self.annuconv1 = nn.Sequential(
+                nn.Conv2d(self.in_channel*2, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        self.annuconv2 = nn.Sequential(
+                nn.Conv2d(self.in_channel*2, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        self.annuconv3 = nn.Sequential(
+                nn.Conv2d(self.in_channel*2, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        # angle encoder
+        self.angle_enc1 = nn.Sequential(
+                nn.Conv2d(1, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        self.k = k
+
+        self.mlp1 = nn.Conv2d(self.in_channel, 1, (1, 1))
+        self.gcn1 = GCN(self.in_channel)
+        
+        self.mlp2 = nn.Conv2d(self.in_channel, 1, (1, 1))
+        self.gcn2 = GCN(self.in_channel)
+
+    def forward(self, coords: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        """
+        Here we take coordinats and features, feature aggregation are guided by coordinates
+        Input:
+            coords:     [B, 3, N]
+            feats:      [B, C, N]
+        Output:
+            feats:      [B, C, N]
+        """
+        B, C, N = features.size() # 1,128,805
+        # import pdb; pdb.set_trace()
+        x0 = features.unsqueeze(-1)  # [B, C, N, 1] 1,128,805,1
+
+        # x1 = get_graph_feature(coords, x0.squeeze(-1), self.k) # 1,128,805,9
+        # x1 = F.leaky_relu(self.in1(self.conv1(x1)), negative_slope=0.2) # 1, 128, 805, 9
+        # x1 = x1.max(dim=-1, keepdim=True)[0] # 1, 128, 805, 1
+
+        x1_old,x1_old_ind = get_graph_feature(coords, x0.squeeze(-1), self.k)
+
+        # x1 = get_graph_feature1(x0,k=self.k)
+        x1 = self.annuconv1(x1_old)
+
+        # ang++
+        coords1=coords.unsqueeze(2).repeat(1, 1, N, 1)
+        nei1 = torch.gather( coords1,dim=-1, index= x1_old_ind.unsqueeze(1).repeat(1,2,1,1))
+        ang1 = cosine_similarity(coords.unsqueeze(-1).repeat(1, 1, 1, 9),nei1) # shape [1, 1, 805, 9])
+        # ang1 = self.ang_mlp(ang1)
+        f_ang1 = self.angle_enc1(ang1)
+
+        # x2,x2_ind = get_graph_feature(coords, x1.squeeze(-1), self.k)
+        # # x2 = get_graph_feature1(x1,k=self.k)
+        # x2 = self.annuconv2(x2)
+
+        # feature space
+        x2_ind = knn(x0.squeeze(-1),self.k) # ([1, 805, 9])
+        x2_nei = get_graph_feature1(x0,k=self.k,idx=x2_ind)
+        x2 = self.annuconv2(x2_nei)
+        # global space
+        w_p1 = self.mlp1(x0).view(B, -1) #[1,805]
+        out_gs1 = self.gcn1(x0, w_p1.detach()) #[1, 128, 805, 1]
+        x25_ind = knn(out_gs1.squeeze(-1), k=self.k)
+        x25_nei = get_graph_feature1(x0,k=self.k,idx=x25_ind)
+        x25 = self.annuconv3(x25_nei)
+
+        # ang++ 
+        # nei2 = torch.gather( coords1,dim=-1, index= x2_ind.unsqueeze(1).repeat(1,2,1,1))
+        # ang2 = cosine_similarity(coords.unsqueeze(-1).repeat(1, 1, 1, 9),nei2)
+        # # ang2 = self.ang_mlp(ang2)
+        # f_ang2 = self.angle_enc1(ang2)
+
+        # x2 = get_graph_feature(coords, x1.squeeze(-1), self.k)
+        # x2 = F.leaky_relu(self.in2(self.conv2(x2)), negative_slope=0.2)
+        # x2 = x2.max(dim=-1, keepdim=True)[0] # 1, 256, 805, 1
+
+        x3 = torch.cat((x0, x1+f_ang1, x2, x25), dim=1) # 1, 512, 805, 1
+        x3 = F.leaky_relu(self.in3(self.conv3(x3)), negative_slope=0.2).view(B, -1, N)
+        # import pdb; pdb.set_trace()
+        # x3 1,128,805
+
+        ############# old part 
+        # x1_old = get_graph_feature(coords, x0.squeeze(-1), self.k)
+        x1_old = F.leaky_relu(self.in1(self.conv1(x1_old)), negative_slope=0.2)
+        x1_old = x1_old.max(dim=-1, keepdim=True)[0]
+
+        # x2_old,x2_old_ind = get_graph_feature(coords, x1_old.squeeze(-1), self.k)
+        # x2_old = F.leaky_relu(self.in2(self.conv2(x2_old)), negative_slope=0.2)
+        # x2_old = x2_old.max(dim=-1, keepdim=True)[0]
+
+        x2_ind_old = knn(x0.squeeze(-1),self.k) # ([1, 805, 9])
+        x2_old_nei = get_graph_feature1(x0,k=self.k,idx=x2_ind_old)
+        x2_old = F.leaky_relu(self.in2(self.conv2(x2_old_nei)), negative_slope=0.2).max(dim=-1, keepdim=True)[0]
+
+        w_p2 = self.mlp2(x0).view(B, -1) #[1,805]
+        out_gs2 = self.gcn2(x0, w_p2.detach()) #[1, 128, 805, 1]
+        x25_old_ind = knn(out_gs2.squeeze(-1), k=self.k)
+        x25_old_nei = get_graph_feature1(x0,k=self.k,idx=x25_old_ind)
+        x25_old = F.leaky_relu(self.in25(self.conv25(x25_old_nei)), negative_slope=0.2).max(dim=-1, keepdim=True)[0]
+
+        x3_old = torch.cat((x0, x1_old, x2_old,x25_old), dim=1)
+        x3_old = self.in3_old(self.conv3_old(x3_old))
+        return x3 + F.leaky_relu(x3_old.view(B, -1, N), negative_slope=0.2)
+    
+# feature space
+class SelfAttention2(nn.Module):
+    def __init__(self, feature_dim: int, k: int = 10) -> None:
+        super(SelfAttention2, self).__init__()
+        self.conv1 = nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=1, bias=False)
+        self.in1 = nn.InstanceNorm2d(feature_dim)
+
+        self.conv2 = nn.Conv2d(
+            feature_dim * 2, feature_dim * 2, kernel_size=1, bias=False
+        )
+        self.in2 = nn.InstanceNorm2d(feature_dim * 2)
+
+        self.conv3 = nn.Conv2d(feature_dim * 3, feature_dim, kernel_size=1, bias=False)
+        self.in3 = nn.InstanceNorm2d(feature_dim)
+
+        self.conv3_old = nn.Conv2d(feature_dim * 4, feature_dim, kernel_size=1, bias=False)
+        self.in3_old = nn.InstanceNorm2d(feature_dim)
+
+        self.in_channel = 128
+        self.annuconv1 = nn.Sequential(
+                nn.Conv2d(self.in_channel*2, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        self.annuconv2 = nn.Sequential(
+                nn.Conv2d(self.in_channel*2, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        # angle encoder
+        # self.angle_enc1 = nn.Sequential(
+        #         nn.Conv2d(1, self.in_channel, (1, 3), stride=(1, 3)),
+        #         nn.InstanceNorm2d(self.in_channel),
+        #         nn.ReLU(inplace=True),
+        #         nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+        #         nn.InstanceNorm2d(self.in_channel),
+        #         nn.ReLU(inplace=True),
+        #     )
+        self.k = k
+
+    def forward(self, coords: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        """
+        Here we take coordinats and features, feature aggregation are guided by coordinates
+        Input:
+            coords:     [B, 3, N]
+            feats:      [B, C, N]
+        Output:
+            feats:      [B, C, N]
+        """
+        B, C, N = features.size() # 1,128,805
+        # import pdb; pdb.set_trace()
+        x0 = features.unsqueeze(-1)  # [B, C, N, 1] 1,128,805,1 
+
+        # x1 = get_graph_feature(coords, x0.squeeze(-1), self.k) # 1,128,805,9
+        # x1 = F.leaky_relu(self.in1(self.conv1(x1)), negative_slope=0.2) # 1, 128, 805, 9
+        # x1 = x1.max(dim=-1, keepdim=True)[0] # 1, 128, 805, 1
+
+        # x1_old,x1_old_ind = get_graph_feature(coords, x0.squeeze(-1), self.k) # x1_old:[1, 256, 805, 9] ind: [1,805,9]
+
+        x1_old_ind = knn(x0.squeeze(-1),self.k) # ([1, 805, 9])
+        x1_old = get_graph_feature1(x0,k=self.k,idx=x1_old_ind)
+        
+        
+        x1 = self.annuconv1(x1_old)
+
+        # ang++
+        # coords1=coords.unsqueeze(2).repeat(1, 1, N, 1)
+        # nei1 = torch.gather( coords1,dim=-1, index= x1_old_ind.unsqueeze(1).repeat(1,2,1,1))
+        # ang1 = cosine_similarity(coords.unsqueeze(-1).repeat(1, 1, 1, 9),nei1) # shape [1, 1, 805, 9])
+        # ang1 = self.ang_mlp(ang1)
+        # f_ang1 = self.angle_enc1(ang1)
+
+        # x2,x2_ind = get_graph_feature(coords, x1.squeeze(-1), self.k)
+        x2_ind = knn(x1.squeeze(-1),self.k) # ([1, 805, 9])
+        x2 = get_graph_feature1(x1,k=self.k,idx=x2_ind)
+        
+        
+        x2 = self.annuconv2(x2)
+
+        # ang++ 
+        # nei2 = torch.gather( coords1,dim=-1, index= x2_ind.unsqueeze(1).repeat(1,2,1,1))
+        # ang2 = cosine_similarity(coords.unsqueeze(-1).repeat(1, 1, 1, 9),nei2)
+        # ang2 = self.ang_mlp(ang2)
+        # f_ang2 = self.angle_enc1(ang2)
+
+        # x2 = get_graph_feature(coords, x1.squeeze(-1), self.k)
+        # x2 = F.leaky_relu(self.in2(self.conv2(x2)), negative_slope=0.2)
+        # x2 = x2.max(dim=-1, keepdim=True)[0] # 1, 256, 805, 1
+
+        x3 = torch.cat((x0, x1, x2), dim=1) # 1, 512, 805, 1
+        x3 = F.leaky_relu(self.in3(self.conv3(x3)), negative_slope=0.2).view(B, -1, N)
+        # import pdb; pdb.set_trace()
+        # x3 1,128,805
+
+        ############# old part 
+        # x1_old = get_graph_feature(coords, x0.squeeze(-1), self.k)
+        x1_old = F.leaky_relu(self.in1(self.conv1(x1_old)), negative_slope=0.2)
+        x1_old = x1_old.max(dim=-1, keepdim=True)[0]
+
+        # x2_old,x2_old_ind = get_graph_feature(coords, x1_old.squeeze(-1), self.k)
+        x2_ind_old = knn(x1_old.squeeze(-1),self.k) # ([1, 805, 9])
+        x2_old = get_graph_feature1(x1_old,k=self.k,idx=x2_ind_old)
+        
+        x2_old = F.leaky_relu(self.in2(self.conv2(x2_old)), negative_slope=0.2)
+        x2_old = x2_old.max(dim=-1, keepdim=True)[0]
+
+        x3_old = torch.cat((x0, x1_old, x2_old), dim=1)
+        x3_old = F.leaky_relu(self.in3_old(self.conv3_old(x3_old)), negative_slope=0.2).view(B, -1, N)
+        return x3 + x3_old
+
+# global space
+class SelfAttention3(nn.Module):
+    def __init__(self, feature_dim: int, k: int = 10) -> None:
+        super(SelfAttention3, self).__init__()
+        self.conv1 = nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=1, bias=False)
+        self.in1 = nn.InstanceNorm2d(feature_dim)
+
+        self.conv2 = nn.Conv2d(
+            feature_dim * 2, feature_dim * 2, kernel_size=1, bias=False
+        )
+        self.in2 = nn.InstanceNorm2d(feature_dim * 2)
+
+        self.conv3 = nn.Conv2d(feature_dim * 3, feature_dim, kernel_size=1, bias=False)
+        self.in3 = nn.InstanceNorm2d(feature_dim)
+
+        self.conv3_old = nn.Conv2d(feature_dim * 4, feature_dim, kernel_size=1, bias=False)
+        self.in3_old = nn.InstanceNorm2d(feature_dim)
+
+        self.in_channel = 128
+        self.annuconv1 = nn.Sequential(
+                nn.Conv2d(self.in_channel*2, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        self.annuconv2 = nn.Sequential(
+                nn.Conv2d(self.in_channel*2, self.in_channel, (1, 3), stride=(1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+                nn.InstanceNorm2d(self.in_channel),
+                nn.ReLU(inplace=True),
+            )
+        # angle encoder
+        # self.angle_enc1 = nn.Sequential(
+        #         nn.Conv2d(1, self.in_channel, (1, 3), stride=(1, 3)),
+        #         nn.InstanceNorm2d(self.in_channel),
+        #         nn.ReLU(inplace=True),
+        #         nn.Conv2d(self.in_channel, self.in_channel, (1, 3)),
+        #         nn.InstanceNorm2d(self.in_channel),
+        #         nn.ReLU(inplace=True),
+        #     )
+        self.k = k
+
+        self.mlp1 = nn.Conv2d(self.in_channel, 1, (1, 1))
+        self.gcn1 = GCN(self.in_channel)
+        
+        self.mlp2 = nn.Conv2d(self.in_channel, 1, (1, 1))
+        self.gcn2 = GCN(self.in_channel)
+        
+        self.mlp3 = nn.Conv2d(self.in_channel, 1, (1, 1))
+        self.gcn3 = GCN(self.in_channel)
+
+    def forward(self, coords: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+        """
+        Here we take coordinats and features, feature aggregation are guided by coordinates
+        Input:
+            coords:     [B, 3, N]
+            feats:      [B, C, N]
+        Output:
+            feats:      [B, C, N]
+        """
+        B, C, N = features.size() # 1,128,805
+        
+        x0 = features.unsqueeze(-1)  # [B, C, N, 1] 1,128,805,1
+
+        # x1 = get_graph_feature(coords, x0.squeeze(-1), self.k) # 1,128,805,9
+        # x1 = F.leaky_relu(self.in1(self.conv1(x1)), negative_slope=0.2) # 1, 128, 805, 9
+        # x1 = x1.max(dim=-1, keepdim=True)[0] # 1, 128, 805, 1
+
+        # x1_old,x1_old_ind = get_graph_feature(coords, x0.squeeze(-1), self.k)
+        # import pdb; pdb.set_trace()
+        w_p1 = self.mlp1(x0).view(B, -1) #[1,805]
+        out_gs1 = self.gcn1(x0, w_p1.detach()) #[1, 128, 805, 1]
+        x1_old_ind = knn(out_gs1.squeeze(-1), k=self.k)
+        x1_old = get_graph_feature1(x0,k=self.k,idx=x1_old_ind)
+        
+
+        # x1 = get_graph_feature1(x0,k=self.k)
+        x1 = self.annuconv1(x1_old)
+
+        # ang++
+        # coords1=coords.unsqueeze(2).repeat(1, 1, N, 1)
+        # nei1 = torch.gather( coords1,dim=-1, index= x1_old_ind.unsqueeze(1).repeat(1,2,1,1))
+        # ang1 = cosine_similarity(coords.unsqueeze(-1).repeat(1, 1, 1, 9),nei1) # shape [1, 1, 805, 9])
+        # # ang1 = self.ang_mlp(ang1)
+        # f_ang1 = self.angle_enc1(ang1)
+
+        # x2,x2_ind = get_graph_feature(coords, x1.squeeze(-1), self.k)
+        w_p2 = self.mlp2(x1).view(B, -1) #[1,805]
+        out_gs2 = self.gcn2(x1, w_p2.detach()) #[1, 128, 805, 1]
+        x2_ind = knn(out_gs2.squeeze(-1), k=self.k)
+        x2 = get_graph_feature1(x1,k=self.k,idx=x2_ind)
+        
+        x2 = self.annuconv2(x2)
+
+        # ang++ 
+        # nei2 = torch.gather( coords1,dim=-1, index= x2_ind.unsqueeze(1).repeat(1,2,1,1))
+        # ang2 = cosine_similarity(coords.unsqueeze(-1).repeat(1, 1, 1, 9),nei2)
+        # # ang2 = self.ang_mlp(ang2)
+        # f_ang2 = self.angle_enc1(ang2)
+
+        # x2 = get_graph_feature(coords, x1.squeeze(-1), self.k)
+        # x2 = F.leaky_relu(self.in2(self.conv2(x2)), negative_slope=0.2)
+        # x2 = x2.max(dim=-1, keepdim=True)[0] # 1, 256, 805, 1
+
+        x3 = torch.cat((x0, x1, x2), dim=1) # 1, 512, 805, 1
+        x3 = F.leaky_relu(self.in3(self.conv3(x3)), negative_slope=0.2).view(B, -1, N)
+        # import pdb; pdb.set_trace()
+        # x3 1,128,805
+
+        ############# old part 
+        # x1_old = get_graph_feature(coords, x0.squeeze(-1), self.k)
+        x1_old = F.leaky_relu(self.in1(self.conv1(x1_old)), negative_slope=0.2)
+        x1_old = x1_old.max(dim=-1, keepdim=True)[0]
+
+        # x2_old,x2_old_ind = get_graph_feature(coords, x1_old.squeeze(-1), self.k)
+        w_p3 = self.mlp3(x1_old).view(B, -1) #[1,805]
+        out_gs3 = self.gcn3(x1_old, w_p3.detach()) #[1, 128, 805, 1]
+        x2_old_ind = knn(out_gs3.squeeze(-1), k=self.k)
+        x2_old = get_graph_feature1(x1_old,k=self.k,idx=x2_old_ind)
+        
+        
+        x2_old = F.leaky_relu(self.in2(self.conv2(x2_old)), negative_slope=0.2)
+        x2_old = x2_old.max(dim=-1, keepdim=True)[0]
+
+        x3_old = torch.cat((x0, x1_old, x2_old), dim=1)
+        x3_old = F.leaky_relu(self.in3_old(self.conv3_old(x3_old)), negative_slope=0.2).view(B, -1, N)
+        return x3 + x3_old
+
+
+class GCN(nn.Module):
+    def __init__(self, in_channel):
+        super(GCN, self).__init__()
+        self.in_channel = in_channel
+        self.conv = nn.Sequential(
+            nn.Conv2d(self.in_channel, self.in_channel, (1, 1)),
+            nn.BatchNorm2d(self.in_channel),
+            nn.ReLU(inplace=True),
+        )
+
+    def gcn(self, x, w):
+        B, _, N, _ = x.size() 
+
+        with torch.no_grad():
+            w = torch.relu(torch.tanh(w)).unsqueeze(-1) 
+            A = torch.bmm(w, w.transpose(1, 2))
+            I = torch.eye(N).unsqueeze(0).to(x.device).detach() 
+            A = A + I
+            D_out = torch.sum(A, dim=-1) 
+            D = (1 / D_out) ** 0.5
+            D = torch.diag_embed(D) 
+            L = torch.bmm(D, A)
+            L = torch.bmm(L, D) 
+        out = x.squeeze(-1).transpose(1, 2).contiguous() 
+        out = torch.bmm(L, out).unsqueeze(-1)
+        out = out.transpose(1, 2).contiguous() 
+
+        return out
+
+    def forward(self, x, w):
+        out = self.gcn(x, w)
+        out = self.conv(out)
+        return out
+
+def MLP(channels: Sequence[int], do_bn: bool = True) -> nn.Sequential:
+    """Multi-layer perceptron"""
+    n = len(channels)
+    layers: List[nn.Module] = []
+    for i in range(1, n):
+        layers.append(nn.Conv1d(channels[i - 1], channels[i], kernel_size=1, bias=True))
+        if i < (n - 1):
+            if do_bn:
+                layers.append(nn.InstanceNorm1d(channels[i]))
+            layers.append(nn.ReLU())
+    return nn.Sequential(*layers)
+
+
+def attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    dim = query.shape[1]
+    scores = torch.einsum("bdhn,bdhm->bhnm", query, key) / dim ** 0.5
+    prob = torch.nn.functional.softmax(scores, dim=-1)
+    return torch.einsum("bhnm,bdhm->bdhn", prob, value), prob
+
+
+class MultiHeadedAttention(nn.Module):
+    """Multi-head attention to increase model expressivitiy"""
+
+    def __init__(self, num_heads: int, d_model: int) -> None:
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.dim = d_model // num_heads
+        self.num_heads = num_heads
+        self.merge = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.proj = nn.ModuleList([deepcopy(self.merge) for _ in range(3)])
+
+    def forward(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        batch_dim = query.size(0)
+        query, key, value = [
+            l(x).view(batch_dim, self.dim, self.num_heads, -1)
+            for l, x in zip(self.proj, (query, key, value))
+        ]
+        x, _ = attention(query, key, value)
+        return self.merge(x.contiguous().view(batch_dim, self.dim * self.num_heads, -1))
+
+
+class AttentionalPropagation(nn.Module):
+    def __init__(self, feature_dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.attn = MultiHeadedAttention(num_heads, feature_dim)
+        self.mlp = MLP([feature_dim * 2, feature_dim * 2, feature_dim])
+        nn.init.constant_(self.mlp[-1].bias, 0.0)
+
+    def forward(self, x: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        message = self.attn(x, source, source)
+        return self.mlp(torch.cat([x, message], dim=1))
+
+
+class SCAttention(nn.Module):
+    """Predator + SuperGlue Self-Cross Attention Implementation"""
+
+    def __init__(
+        self,
+        layer_names: Iterable[str], # self,cross,self
+        num_head: int = 4,
+        feature_dim: int = 128,
+        k: int = 9,
+    ) -> None:
+        super().__init__()
+        self.names = layer_names
+        layers: List[nn.Module] = []
+        for atten_type in layer_names:
+            if atten_type == "self1":
+                # print(1)
+                layers.append(SelfAttention1(feature_dim, k))
+            elif atten_type == "self2":
+                # print(2)
+                layers.append(SelfAttention2(feature_dim, k))
+            elif atten_type == "self3":
+                # print(3)
+                layers.append(SelfAttention3(feature_dim, k))
+            else:
+                layers.append(AttentionalPropagation(feature_dim, num_head))
+        self.layers = nn.ModuleList(layers)
+
+    def forward(
+        self,
+        desc0: torch.Tensor,
+        desc1: torch.Tensor,
+        coords0: torch.Tensor,
+        coords1: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Inputs: descs [B, C, N] *coords: [B, D, N]
+        for layer, name in zip(self.layers, self.names):
+            if name == "cross":
+                desc0 = desc0 + layer(desc0, desc1)
+                desc1 = desc1 + layer(desc1, desc0)
+            # elif name == "self":
+            else:
+                desc0 = layer(coords0, desc0)
+                desc1 = layer(coords1, desc1)
+        return desc0, desc1
