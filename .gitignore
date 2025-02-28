@@ -1,6 +1,9 @@
 # Custom to the project
 /outputs
 /data
+/tool
+/requirements.txt
+/gitignore
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

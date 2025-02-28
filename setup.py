@@ -16,7 +16,7 @@ class VersionExtractor(NodeVisitor):
 
 def parse_version():
 
-    with open(os.path.join("gomatch", "__init__.py"), "r") as f:
+    with open(os.path.join("a2gnn", "__init__.py"), "r") as f:
         content = f.read()
 
     tree = ast.parse(content)
@@ -31,10 +31,10 @@ def long_description():
 
 
 setup(
-    name="gomatch",
+    name="a2gnn",
     version=parse_version(),
     license="MIT",
-    description="GoMatch: a geometric-only matcher for visual localization",
+    # description="GoMatch: a geometric-only matcher for visual localization",
     long_description=long_description(),
     long_description_content_type="text/markdown",
     install_requires=[
@@ -44,8 +44,8 @@ setup(
         "Pillow",
         "pytorch-lightning",
         "scipy",
-        "torch==1.7.1",
-        "torch-scatter==2.0.6",
+        # "torch==1.7.1",
+        # "torch-scatter==2.0.6",
         "tqdm",
     ],
     extras_require=dict(
@@ -54,8 +54,8 @@ setup(
             "colmap @ git+https://github.com/SergioRAgostinho/colmap.git@python-packaging#egg=colmap",
         ]
     ),
-    author="Qunjie Zhou & Sérgio Agostinho",
-    author_email="gomatch@googlegroups.com",
+    author="Yejun Zhang, Shuzhe Wang, Juho Kannala",
+    author_email="yejun.zhang@aalto.fi",
     packages=find_packages(),
     python_requires=">=3.7",
     classifiers=[
