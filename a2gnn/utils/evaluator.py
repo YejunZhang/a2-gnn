@@ -36,9 +36,9 @@ def prepare_sample_inputs(
     if isinstance(pts3d, np.ndarray):
         pts3d = torch.from_numpy(pts3d)
     if isinstance(color2d, np.ndarray):
-        pts2d = torch.from_numpy(color2d)
+        color2d = torch.from_numpy(color2d)
     if isinstance(color3d, np.ndarray):
-        pts3d = torch.from_numpy(color3d)
+        color3d = torch.from_numpy(color3d)
 
     pts2d = pts2d.to(device)
     pts3d = pts3d.to(device)
