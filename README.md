@@ -48,13 +48,13 @@ We appreciate the previous open-source repository [GoMatch](https://github.com/d
 Please consider citing our papers if you find this code useful for your research:
 
 ```
-@misc{zhang2025a2gnnangleannulargnnvisual,
-      title={A2-GNN: Angle-Annular GNN for Visual Descriptor-free Camera Relocalization}, 
-      author={Yejun Zhang and Shuzhe Wang and Juho Kannala},
-      year={2025},
-      eprint={2502.20036},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2502.20036}, 
+@inproceedings{zhang2025a2gnn,
+  title        = {A2-GNN: Angle-Annular GNN for Visual Descriptor-free Camera Relocalization},
+  author       = {Zhang, Yejun and Wang, Shuzhe and Kannala, Juho},
+  booktitle    = {2025 International Conference on 3D Vision (3DV)},
+  pages        = {357--368},
+  year         = {2025},
+  organization = {IEEE},
+  doi          = {10.1109/3DV66043.2025.00038}
 }
 ```
